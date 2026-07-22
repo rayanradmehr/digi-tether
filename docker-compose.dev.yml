@@ -1,0 +1,45 @@
+# Development-only compose file.
+# Provides local PostgreSQL and RabbitMQ so the backend can boot with real
+# infrastructure dependencies without requiring cloud services in dev.
+# NOT intended for production use (see Docker-Rules: production compose is
+# explicitly out of scope for Phase 0).
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: .
+      target: build
+    command: pnpm run start:dev
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/app
+      - /app/node_modules
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: digi_tether
+      POSTGRES_PASSWORD: digi_tether
+      POSTGRES_DB: digi_tether
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+
+volumes:
+  postgres_data:

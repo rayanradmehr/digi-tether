@@ -1,1 +1,2 @@
-// Events barrel — export base event type and EventEmitter registration
+export * from './app-event.interface';
+export * from './events.module';

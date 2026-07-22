@@ -1,1 +1,5 @@
-// Pagination defaults (DEFAULT_LIMIT, MAX_LIMIT)
+export const PAGINATION = {
+  DEFAULT_LIMIT: 20,
+  MAX_LIMIT: 100,
+  DEFAULT_PAGE: 1,
+} as const;

@@ -1,1 +1,9 @@
-// PaginatedResult<T> — generic wrapper: data[], total, page, limit, totalPages
+export interface PaginatedResult<T> {
+  data: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+}

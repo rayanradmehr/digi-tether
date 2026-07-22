@@ -1,145 +1,168 @@
-# SignerJobModule — Service Layer
+# SignerJobModule
 
-## Purpose
-
-`SignerJobService` is the **sole authority** over the lifecycle of every
-`signer_jobs` row. It is the only component that may mutate the status,
-claim fields, result, or error of a SignerJob. No other component may
-call the repository directly for mutations.
+This module owns the complete lifecycle of `signer_jobs` rows and exposes
+the Pull API used by the Offline Signer.
 
 ---
 
-## Responsibilities
+## Pull Architecture
 
-1. **Create jobs** — Accept a sealed `SignerPayload` and persist a new
-   `PENDING` row. Extract denormalised columns. Never build or inspect
-   payload contents.
-
-2. **Enforce the state machine** — Every lifecycle method applies
-   pre-condition checks and throws a typed domain error on invalid paths.
-
-3. **Enforce field immutability** — After creation, no mutation method
-   ever includes immutable columns in its update changes object.
-
-4. **Log every transition** — Every successful state change produces a
-   structured log entry. Expiry produces a `warn`. Failure produces an `error`.
-
-5. **Expose aggregate counters** — `countPending()` and `countClaimed()`
-   for monitoring and admin dashboards.
-
----
-
-## Non-Responsibilities (Strict)
-
-This service **must never**:
-
-- Build, parse, modify, or validate a `SignerPayload` or `signingPayload`.
-- Call any `BlockchainDriver` method.
-- Perform cryptographic operations.
-- Communicate with the Offline Signer (HTTP, gRPC, queue).
-- Call RPC nodes.
-- Publish domain events or queue messages (Step 4).
-- Know what `CREATE_WALLET`, `SWEEP`, or `WITHDRAW` mean at a business level.
-- Import from `WalletModule`, `SweepModule`, `WithdrawalModule`, `NetworkModule`, or `TokenModule`.
-
----
-
-## State Machine
+The communication between the Backend and the Offline Signer is **strictly
+pull-based**. The Backend never initiates contact with the Signer.
 
 ```
-          ┌─────────────────────────────────────────────┐
-          │              createJob()                     │
-          └──────────────────┬──────────────────────────┘
-                             │
-                             ▼
-                         PENDING
-                        /   │   \
-               claim() /    │    \ cancel()
-                      /     │     \
-                     ▼      │      ▼
-                 CLAIMED    │   CANCELLED (terminal)
-                 /   \     │
-      complete() /   fail() │ expire()
-                /        \  │
-               ▼          ▼ ▼
-          COMPLETED     FAILED    EXPIRED
-          (terminal)  (terminal) (terminal)
+  ┌─────────────────────────────────────────────────────────┐
+  │                    Offline Signer                       │
+  │                                                         │
+  │  loop:                                                  │
+  │    GET /signer/jobs/available  ──────────────────────►  │
+  │    ◄──────────── 200 (job) or 204 (empty)               │
+  │                                                         │
+  │    if 200:                                              │
+  │      POST /signer/jobs/:requestId/claim  ────────────►  │
+  │      ◄──────────── 200 (payload) or 409 (conflict)      │
+  │                                                         │
+  │    if 200 (claimed):                                    │
+  │      sign signingPayload → return result (Step 5)       │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-**Terminal states**: `COMPLETED`, `FAILED`, `EXPIRED`, `CANCELLED`.
-No transition out of a terminal state is permitted under any circumstances.
+### Why Polling?
+
+1. **Air-gap compatibility** — The Offline Signer may live in a network
+   segment with no inbound connectivity. Polling requires only outbound
+   TCP from the Signer to the Backend.
+
+2. **No persistent connection required** — WebSockets and long-polling
+   require connection state. Polling is stateless and resilient to
+   Signer restarts.
+
+3. **Simplified authentication surface** — Mutual TLS or WireGuard is
+   easier to configure on outbound-only connections.
+
+4. **No push infrastructure** — No WebSocket server, no SSE, no queue
+   consumer on the Signer side. The Signer binary is a simple HTTP client.
+
+5. **Back-pressure for free** — If the Signer is slow or offline,
+   jobs accumulate in PENDING state without requiring queue management.
+   The expiry cron handles stale jobs independently.
+
+### Why the Backend Never Pushes
+
+- The Backend has no stable address for the Signer.
+- Pushing would require the Backend to know the Signer's network location,
+  introducing a coupling the architecture explicitly forbids.
+- Pushing to an offline Signer requires retry/queue logic. Polling
+  eliminates this complexity entirely.
 
 ---
 
-## Permitted Transitions
+## Endpoints
 
-| From | Operation | To | Guard |
-|---|---|---|---|
-| `PENDING` | `claimJob()` | `CLAIMED` | expiresAt not passed |
-| `PENDING` | `cancelJob()` | `CANCELLED` | — |
-| `PENDING` | `expireJob()` | `EXPIRED` | expiresAt must have passed |
-| `CLAIMED` | `completeJob()` | `COMPLETED` | claimToken must match |
-| `CLAIMED` | `markFailed()` | `FAILED` | — |
-| `CLAIMED` | `cancelJob()` | `CANCELLED` | — |
-| `CLAIMED` | `expireJob()` | `EXPIRED` | expiresAt must have passed |
+### `GET /signer/jobs/available`
+
+**Purpose**: Returns one available job for the Signer to inspect before
+committing to a claim.
+
+**Availability criteria** (all must be true):
+- `status == PENDING`
+- `expiresAt > now`
+- `retryCount <= maxRetries`
+
+**Ordering**: `createdAt ASC` — oldest first (FIFO).
+
+**Returns**: One `AvailableJobResponse` or HTTP 204 No Content.
+
+**What is NOT included**: `signingPayload`, `payloadDigest`,
+`integritySignature` — these are only delivered after atomic claim.
 
 ---
 
-## Forbidden Transitions
+### `POST /signer/jobs/:requestId/claim`
 
-| From | Operation | Why |
+**Purpose**: Atomically acquires ownership of a PENDING job.
+
+**Body**: `{ signerInstanceId: string }` — stable Signer identity.
+
+**Returns**: `ClaimJobResponse` containing the full sealed `SignerPayload`
+including `signingPayload`, `payloadDigest`, and `integritySignature`.
+
+**On conflict**: HTTP 409 — another Signer already claimed the job.
+The losing Signer discards the requestId and polls again.
+
+---
+
+## Atomic Claim
+
+The claim operation is atomic at the database level:
+
+1. `SignerJobService.claimJob()` fetches the job by UUID.
+2. It verifies `status == PENDING` (throws `SignerJobAlreadyClaimedError`
+   if `CLAIMED`).
+3. It calls `SignerJobRepository.update()` which uses TypeORM optimistic
+   locking (`@VersionColumn`). The SQL `WHERE version = $n` clause ensures
+   only one concurrent writer succeeds.
+4. The losing concurrent claim receives a database optimistic lock exception,
+   which propagates as `SignerJobAlreadyClaimedError` → HTTP 409.
+
+No application-level mutex, Redis lock, or queue is required.
+
+---
+
+## Authentication (Future)
+
+Authentication is **not implemented** in Phase 3.5 Step 4.
+Extension points are marked with `// AUTH-EXT:` comments in the controller.
+
+### Planned Mechanisms
+
+| Mechanism | Attachment Point | Notes |
 |---|---|---|
-| `COMPLETED` | Any mutation | Terminal — immutable |
-| `FAILED` | Any mutation | Terminal — immutable |
-| `EXPIRED` | Any mutation | Terminal — immutable |
-| `CANCELLED` | Any mutation | Terminal — immutable |
-| `PENDING` | `completeJob()` | Must be CLAIMED first |
-| `PENDING` | `markFailed()` | Must be CLAIMED first |
-| `CLAIMED` | `claimJob()` | Already claimed |
+| **Mutual TLS** | `@UseGuards(SignerMtlsGuard)` on controller | Reads `req.socket.getPeerCertificate()` |
+| **WireGuard Identity** | `app.use(wireguardMiddleware)` in `main.ts` | Trusted header from local proxy |
+| **API Key** | `@UseGuards(SignerApiKeyGuard)` + `@ApiBearerAuth()` | Already declared in Swagger |
+| **Certificate Pinning** | Reverse proxy (nginx/Caddy) | No app-level change required |
+
+When mTLS is activated, `signerInstanceId` in the request body will be
+replaced or verified by the CN extracted from the verified peer certificate.
 
 ---
 
-## Immutability Guarantees
+## Logging Policy
 
-Once a job row is persisted, the service **never** includes the following
-fields in any `update()` call:
+| Event | Level | What is logged |
+|---|---|---|
+| Queue polled, job found | `log` | `requestId`, `payloadVersion` |
+| Queue polled, empty | `debug` | Poll event only |
+| Job claimed | `log` | `requestId`, `signerInstanceId` |
+| Claim rejected (conflict) | `warn` (service layer) | `requestId`, `signerInstanceId` |
 
-- `payload` (entire JSONB — contains `signingPayload`, `payloadDigest`, `integritySignature`)
-- `requestId`
-- `walletId`
-- `networkId`
-- `jobType`
-- `payloadVersion`
-- `protocolVersion`
-- `expiresAt`
-- `referenceId`
-- `referenceType`
-- `createdAt`
-
-The unit tests verify this explicitly for every mutating method.
+**Never logged**:
+- `signingPayload`
+- `integritySignature`
+- `payloadDigest`
+- Any private key material
 
 ---
 
-## Domain Errors
+## Service Layer (Step 3)
 
-| Error Class | HTTP | Code | When |
-|---|---|---|---|
-| `SignerJobNotFoundError` | 404 | `SIGNER_JOB_NOT_FOUND` | Row not found |
-| `SignerJobExpiredError` | 410 | `SIGNER_JOB_EXPIRED` | expiresAt has passed (on claim) |
-| `SignerJobAlreadyClaimedError` | 409 | `SIGNER_JOB_ALREADY_CLAIMED` | Status is CLAIMED on claim attempt |
-| `SignerJobInvalidStatusError` | 422 | `SIGNER_JOB_INVALID_STATUS` | Illegal state transition or guard failure |
-| `SignerJobCompletedError` | 409 | `SIGNER_JOB_ALREADY_COMPLETED` | Mutation on COMPLETED job |
+For the complete lifecycle documentation, state machine, and domain error
+table, see the **Service Layer** section of this README and
+`services/signer-job.service.ts`.
 
----
+### State Machine (summary)
 
-## Dependencies
+```
+PENDING → CLAIMED → COMPLETED
+PENDING → CANCELLED
+PENDING → EXPIRED
+CLAIMED → FAILED
+CLAIMED → CANCELLED
+CLAIMED → EXPIRED
+```
 
-| Dependency | Role |
-|---|---|
-| `SignerJobRepository` | Data access only — never direct TypeORM |
-| `ILogger` | Structured logging for every transition |
-
-`SignerJobService` has **no other dependencies**.
+Terminal states: `COMPLETED`, `FAILED`, `EXPIRED`, `CANCELLED`.
 
 ---
 
@@ -148,3 +171,5 @@ The unit tests verify this explicitly for every mutating method.
 - Phase 3.5 Architecture Document, Revision 3 (Frozen)
 - ADR-JM-001 through ADR-JM-013
 - Phase 3.5 Step 2 (persistence layer)
+- Phase 3.5 Step 3 (service layer)
+- Phase 3.5 Step 4 (this file — HTTP interface)

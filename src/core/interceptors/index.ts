@@ -1,1 +1,2 @@
-// Interceptors barrel — export global interceptors
+export * from './logging.interceptor';
+export * from './response.interceptor';

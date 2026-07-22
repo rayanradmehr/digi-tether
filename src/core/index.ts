@@ -1,5 +1,6 @@
-// core barrel — re-exports CoreModule and all global providers
 export * from './core.module';
+export * from './exceptions';
 export * from './filters';
 export * from './interceptors';
-export * from './guards';
+export * from './middleware';
+export * from './pipes';

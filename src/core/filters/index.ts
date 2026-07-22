@@ -1,1 +1,1 @@
-// Filters barrel — export global exception filter
+export * from './global-exception.filter';

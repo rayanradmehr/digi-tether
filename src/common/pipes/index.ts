@@ -1,1 +1,2 @@
-// Pipes barrel — export all reusable transformation pipes
+export * from './parse-positive-int.pipe';
+export * from './trim-strings.pipe';

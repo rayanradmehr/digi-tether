@@ -1,190 +1,145 @@
-# SignerJobModule
+# SignerJobModule — Service Layer
 
 ## Purpose
 
-The `SignerJobModule` is the formal contract layer between the Digi-Tether
-Blockchain Backend and the future Offline Signer (a separate Rust application).
-
-It acts as a **passive, pull-only job queue** backed by the `signer_jobs`
-PostgreSQL table. The Backend never contacts the Signer. The Signer polls,
-claims, signs offline, and submits results. The Backend validates and stores
-results. Everything is pull-based.
-
----
-
-## What This Module Is
-
-- A **durable job store** for cryptographic signing requests.
-- A **pull-only HTTP surface** the Offline Signer polls.
-- A **result receiver** that validates and persists Signer responses.
-- A **domain event emitter** that notifies upstream modules when signing completes.
+`SignerJobService` is the **sole authority** over the lifecycle of every
+`signer_jobs` row. It is the only component that may mutate the status,
+claim fields, result, or error of a SignerJob. No other component may
+call the repository directly for mutations.
 
 ---
 
 ## Responsibilities
 
-1. **Job Intake** — Accept pre-built, sealed `SignerPayload` objects from
-   internal modules (Wallet, Sweep, Withdrawal) and persist them as
-   `PENDING` rows in `signer_jobs`.
+1. **Create jobs** — Accept a sealed `SignerPayload` and persist a new
+   `PENDING` row. Extract denormalised columns. Never build or inspect
+   payload contents.
 
-2. **Payload Storage and Delivery** — Store the `SignerPayload` JSONB column
-   verbatim and serve it to the Signer on poll. The module is a transparent
-   carrier; it never parses payload contents.
+2. **Enforce the state machine** — Every lifecycle method applies
+   pre-condition checks and throws a typed domain error on invalid paths.
 
-3. **Job Persistence** — Every job is a durable database row. No in-memory
-   state. Jobs survive application restarts and pod failures.
+3. **Enforce field immutability** — After creation, no mutation method
+   ever includes immutable columns in its update changes object.
 
-4. **Signer API Surface** — Three endpoints: list available jobs, claim a
-   job, submit a result. Nothing else.
+4. **Log every transition** — Every successful state change produces a
+   structured log entry. Expiry produces a `warn`. Failure produces an `error`.
 
-5. **Result Acceptance** — Validate the `SignerResult`, transition job
-   status, write the result column, emit domain events.
+5. **Expose aggregate counters** — `countPending()` and `countClaimed()`
+   for monitoring and admin dashboards.
 
 ---
 
 ## Non-Responsibilities (Strict)
 
-This module **must never**:
+This service **must never**:
 
-- Parse or interpret `signingPayload` bytes.
-- Modify `signingPayload` in any way.
-- Build, assemble, or modify a `SignerPayload` (that is `SigningPayloadBuilder`).
-- Compute `payloadDigest` (that is `SigningPayloadBuilder`).
-- Generate `integritySignature` directly (that is `IntegritySignatureService`).
+- Build, parse, modify, or validate a `SignerPayload` or `signingPayload`.
 - Call any `BlockchainDriver` method.
-- Calculate nonce, gas, fee, energy, or bandwidth.
+- Perform cryptographic operations.
+- Communicate with the Offline Signer (HTTP, gRPC, queue).
 - Call RPC nodes.
-- Broadcast signed transactions.
-- Hold private keys.
+- Publish domain events or queue messages (Step 4).
 - Know what `CREATE_WALLET`, `SWEEP`, or `WITHDRAW` mean at a business level.
-- Communicate proactively with the Offline Signer.
+- Import from `WalletModule`, `SweepModule`, `WithdrawalModule`, `NetworkModule`, or `TokenModule`.
 
 ---
 
-## Execution Pipeline
+## State Machine
 
 ```
-Business Module (Wallet / Sweep / Withdrawal)
-  ↓ calls BlockchainDriver (builds signingPayload)
-  ↓
-BlockchainDriver  →  signingPayload bytes (deterministic, opaque)
-  ↓
-SigningPayloadBuilder  →  assembles + seals SignerPayload
-  ↓
-IntegritySignatureService  →  generates integritySignature
-  ↓
-SignerJobService  →  persists SignerJob row (status = PENDING)
-  ↓
-Database (signer_jobs table)
-  ↓  ← Signer polls
-Offline Signer  →  verifies + signs + returns SignerResult
-  ↓
-SignerJobService  →  validates + writes result (status = COMPLETED)
-  ↓
-Business Module receives signer_job.completed event
-  ↓
-BlockchainDriver  →  broadcasts signed transaction
+          ┌─────────────────────────────────────────────┐
+          │              createJob()                     │
+          └──────────────────┬──────────────────────────┘
+                             │
+                             ▼
+                         PENDING
+                        /   │   \
+               claim() /    │    \ cancel()
+                      /     │     \
+                     ▼      │      ▼
+                 CLAIMED    │   CANCELLED (terminal)
+                 /   \     │
+      complete() /   fail() │ expire()
+                /        \  │
+               ▼          ▼ ▼
+          COMPLETED     FAILED    EXPIRED
+          (terminal)  (terminal) (terminal)
 ```
 
----
-
-## Persistence Rules
-
-| Rule | Detail |
-|---|---|
-| No hard deletes | `signer_jobs` rows are never physically deleted (ADR-JM-006). |
-| Soft delete only | `deleted_at` column exists as a safety mechanism; not used in normal flow. |
-| Optimistic locking | `@VersionColumn` prevents concurrent lost-update races. |
-| FIFO polling | `findAvailable()` orders by `created_at ASC`. |
-| TTL enforced | `expiresAt` is denormalised to a column for indexed cron queries. |
-| Indexed status | `status` and `(status, expires_at)` are indexed for cron and poll performance. |
+**Terminal states**: `COMPLETED`, `FAILED`, `EXPIRED`, `CANCELLED`.
+No transition out of a terminal state is permitted under any circumstances.
 
 ---
 
-## Immutability Rules
+## Permitted Transitions
 
-Once a `signer_jobs` row is persisted, the following fields **must never change**:
+| From | Operation | To | Guard |
+|---|---|---|---|
+| `PENDING` | `claimJob()` | `CLAIMED` | expiresAt not passed |
+| `PENDING` | `cancelJob()` | `CANCELLED` | — |
+| `PENDING` | `expireJob()` | `EXPIRED` | expiresAt must have passed |
+| `CLAIMED` | `completeJob()` | `COMPLETED` | claimToken must match |
+| `CLAIMED` | `markFailed()` | `FAILED` | — |
+| `CLAIMED` | `cancelJob()` | `CANCELLED` | — |
+| `CLAIMED` | `expireJob()` | `EXPIRED` | expiresAt must have passed |
 
-- `jobType`
+---
+
+## Forbidden Transitions
+
+| From | Operation | Why |
+|---|---|---|
+| `COMPLETED` | Any mutation | Terminal — immutable |
+| `FAILED` | Any mutation | Terminal — immutable |
+| `EXPIRED` | Any mutation | Terminal — immutable |
+| `CANCELLED` | Any mutation | Terminal — immutable |
+| `PENDING` | `completeJob()` | Must be CLAIMED first |
+| `PENDING` | `markFailed()` | Must be CLAIMED first |
+| `CLAIMED` | `claimJob()` | Already claimed |
+
+---
+
+## Immutability Guarantees
+
+Once a job row is persisted, the service **never** includes the following
+fields in any `update()` call:
+
+- `payload` (entire JSONB — contains `signingPayload`, `payloadDigest`, `integritySignature`)
 - `requestId`
 - `walletId`
 - `networkId`
+- `jobType`
 - `payloadVersion`
 - `protocolVersion`
-- `payload` (entire JSONB column — includes `signingPayload`, `payloadDigest`, `integritySignature`, `transactionVersion`)
 - `expiresAt`
 - `referenceId`
 - `referenceType`
 - `createdAt`
 
-Only the following fields may change after creation:
-
-- `status`
-- `claimedBy`
-- `claimedAt`
-- `claimToken`
-- `completedAt`
-- `retryCount`
-- `result`
-- `errorMessage`
-- `updatedAt` (automatic)
-- `version` (automatic)
+The unit tests verify this explicitly for every mutating method.
 
 ---
 
-## Module Boundaries
+## Domain Errors
 
-### This module imports
-
-- `TypeOrmModule.forFeature([SignerJob])` — entity registration.
-- `NetworkModule` — read-only access to `NetworkService` for populating
-  `SignerPayload.network` context inside `SigningPayloadBuilder`.
-- `SharedModule` (global) — `ILogger`, `ICache`, `IEventPublisher`.
-- `ScheduleModule` — for the stale-claim expiry cron task.
-
-### This module exports
-
-- `SignerJobService` — consumed by `WalletModule`, `SweepModule`, `WithdrawalModule`.
-- `SigningPayloadBuilder` — consumed by the same upstream modules to assemble
-  payloads before calling `createJob()`.
-
-### Dependency direction
-
-```
-WalletModule ──────────────►┐
-SweepModule ────────────────► SignerJobModule ──► NetworkModule
-WithdrawalModule ───────────►┘                └──► SharedModule
-```
-
-`SignerJobModule` never imports `WalletModule`, `SweepModule`, or
-`WithdrawalModule`. The dependency arrow is strictly one-way.
+| Error Class | HTTP | Code | When |
+|---|---|---|---|
+| `SignerJobNotFoundError` | 404 | `SIGNER_JOB_NOT_FOUND` | Row not found |
+| `SignerJobExpiredError` | 410 | `SIGNER_JOB_EXPIRED` | expiresAt has passed (on claim) |
+| `SignerJobAlreadyClaimedError` | 409 | `SIGNER_JOB_ALREADY_CLAIMED` | Status is CLAIMED on claim attempt |
+| `SignerJobInvalidStatusError` | 422 | `SIGNER_JOB_INVALID_STATUS` | Illegal state transition or guard failure |
+| `SignerJobCompletedError` | 409 | `SIGNER_JOB_ALREADY_COMPLETED` | Mutation on COMPLETED job |
 
 ---
 
-## Job Status State Machine
+## Dependencies
 
-```
-PENDING ──► CLAIMED ──► COMPLETED  (terminal)
-PENDING ──► CANCELLED              (terminal)
-CLAIMED ──► FAILED                 (terminal)
-CLAIMED ──► EXPIRED                (terminal — cron-detected TTL breach)
-```
+| Dependency | Role |
+|---|---|
+| `SignerJobRepository` | Data access only — never direct TypeORM |
+| `ILogger` | Structured logging for every transition |
 
-Terminal states are immutable. No transition out of a terminal state
-is permitted under any circumstances.
-
----
-
-## Supported Job Types (Internal)
-
-| Type | Origin | Signer sees it? |
-|---|---|---|
-| `CREATE_WALLET` | WalletModule | ❌ Never |
-| `SWEEP` | SweepModule | ❌ Never |
-| `WITHDRAW` | WithdrawalModule | ❌ Never |
-
-All three are translated into a generic `SignerPayload` before the Signer
-polls. The Signer receives only opaque bytes and cryptographic metadata.
+`SignerJobService` has **no other dependencies**.
 
 ---
 
@@ -192,3 +147,4 @@ polls. The Signer receives only opaque bytes and cryptographic metadata.
 
 - Phase 3.5 Architecture Document, Revision 3 (Frozen)
 - ADR-JM-001 through ADR-JM-013
+- Phase 3.5 Step 2 (persistence layer)

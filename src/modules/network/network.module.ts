@@ -3,45 +3,40 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Network } from './entities/network.entity';
 import { NetworkRepository } from './repositories/network.repository';
 import { NetworkService } from './services/network.service';
-import { NetworkController } from './controllers/network.controller';
 
 /**
  * Network Module — the dependency root for all blockchain operations.
  *
- * ## What this module provides
- * - `NetworkService` — the single exported business-layer provider.
- *   Every downstream module (Token, Wallet, Deposit, …) injects this
- *   service to validate network existence and retrieve metadata.
+ * ## Wired providers (Step 3)
+ * | Provider            | Scope    | Exported |
+ * |---------------------|----------|----------|
+ * | `NetworkRepository` | Internal | No       |
+ * | `NetworkService`    | Internal | Yes      |
  *
- * ## What this module does NOT provide
- * - RPC clients or blockchain SDK instances
- * - Driver implementations (those live in the Drivers layer)
- * - Wallet, Deposit, Withdrawal, or Sweep logic
- * - Queue publishers or consumers
+ * ## What is intentionally absent in this step
+ * - `NetworkController` — wired in Step 4 (HTTP layer).
+ * - Queue publishers — Phase 3+.
+ * - Event publishers — Phase 3+.
  *
  * ## Module boundary rule
  * Only `NetworkService` is listed in `exports`.
- * `NetworkRepository` and the `Network` entity are internal — downstream
- * modules must never query the `networks` table directly.
- *
- * ## Import in AppModule
- * ```ts
- * // src/app.module.ts
- * imports: [ ..., NetworkModule ]
- * ```
+ * Downstream modules (Token, Wallet, Deposit, …) import `NetworkModule`
+ * and inject `NetworkService`. They must never access `NetworkRepository`
+ * or query the `networks` table directly.
  *
  * ## Usage in a downstream module
  * ```ts
- * // src/modules/token/token.module.ts
- * imports: [NetworkModule]
- * // then in TokenService:
+ * // downstream.module.ts
+ * @Module({ imports: [NetworkModule] })
+ * export class DownstreamModule {}
+ *
+ * // downstream.service.ts
  * constructor(private readonly networkService: NetworkService) {}
  * ```
  */
 @Module({
   imports: [TypeOrmModule.forFeature([Network])],
   providers: [NetworkRepository, NetworkService],
-  controllers: [NetworkController],
   exports: [NetworkService],
 })
 export class NetworkModule {}

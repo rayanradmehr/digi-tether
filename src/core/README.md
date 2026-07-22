@@ -1,11 +1,15 @@
-# core
+# src/core
 
-Framework-independent building blocks shared by the domain/application layer
-of every module: `Result`, `DomainError`, and future primitives such as
-`AggregateRoot` or `ValueObject`.
+Bootstrap wiring layer. Registered once at application startup via AppModule.
 
-Rules:
-- Must never import from `@nestjs/*` or any blockchain SDK.
-- Must never import from `modules/*` (only the reverse is allowed).
-- No business rules for a specific domain (wallet, deposit, ...) live here —
-  only generic, reusable primitives.
+## Files
+- `core.module.ts` — assembles all global providers
+- `filters/` — global exception filter (ApiResponse<null> shape)
+- `interceptors/` — global response wrapper and request logger
+- `guards/` — global guards (e.g. JWT guard if applied universally)
+
+## Hard Rules
+- No business logic
+- No module-specific guards (those belong in their own module)
+- No stateful services
+- May import from `src/shared` and `src/common` only

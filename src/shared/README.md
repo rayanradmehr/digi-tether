@@ -1,7 +1,15 @@
-# shared
+# src/shared
 
-Shared kernel: small, stable, framework-independent types/utilities used by
-more than one module's domain layer (e.g. `Nullable<T>`). Unlike `core/`,
-which holds architectural primitives (Result, DomainError), `shared/` holds
-plain data-shape helpers. Kept intentionally minimal — anything module
-specific belongs inside that module, not here.
+NestJS-aware infrastructure layer. All providers here are registered globally.
+
+## Sub-folders
+- `logger/` — structured application logger (AppLoggerService)
+- `cache/` — Redis-backed cache service (CacheService)
+- `queue/` — RabbitMQ publisher and base consumer (QueueModule)
+- `events/` — in-process EventEmitter2 bus (EventsModule)
+
+## Hard Rules
+- Never import from `src/modules`
+- Never import from `src/shared` itself (no cross-service deps within shared)
+- May import from `src/common` and `src/config` only
+- Every service here must be injectable and exportable via its own module

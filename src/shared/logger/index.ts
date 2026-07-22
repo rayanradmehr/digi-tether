@@ -1,1 +1,3 @@
-// Logger barrel — export logger service and module
+export * from './logger.interface';
+export * from './logger.module';
+export * from './logger.service';

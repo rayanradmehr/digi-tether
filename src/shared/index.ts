@@ -1,5 +1,7 @@
-// shared barrel — re-exports everything from all shared sub-folders
-export * from './logger';
 export * from './cache';
-export * from './queue';
 export * from './events';
+export * from './logger';
+export * from './queue';
+export * from './shared.module';
+export * from './tokens';
+export * from './types';

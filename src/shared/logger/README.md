@@ -1,15 +1,18 @@
 # shared/logger
 
-Structured application logger. Wraps NestJS LoggerService with a consistent format.
+Structured application logger abstraction.
 
 ## Files
-- `logger.service.ts` — `AppLoggerService` injectable
-- `logger.module.ts` — `LoggerModule` (registered globally)
+- `logger.interface.ts` — `ILogger` contract (verbose/debug/log/warn/error)
+- `logger.service.ts` — `AppLoggerService` — NestJS `Logger`-backed implementation
+- `logger.module.ts` — `LoggerModule` — global module, registers `INJECTION_TOKENS.LOGGER`
 
-## Log Entry Shape
-Every log line carries: `timestamp`, `level`, `context`, `correlationId`, `message`.
+## Usage in a module
+```ts
+@Inject(INJECTION_TOKENS.LOGGER) private readonly logger: ILogger
+```
 
 ## Rules
-- No `console.log` anywhere in the codebase — use this service
-- No business-specific log messages defined here
-- No hardcoded module names or entity-specific fields
+- Never import `AppLoggerService` directly in business modules
+- Always inject via `INJECTION_TOKENS.LOGGER` + `ILogger` type
+- No `console.log` anywhere in the codebase

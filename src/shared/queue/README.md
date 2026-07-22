@@ -1,14 +1,20 @@
 # shared/queue
 
-RabbitMQ integration via `@nestjs/microservices` + `amqplib`.
+Async message queue abstraction.
 
 ## Files
-- `queue.publisher.ts` — `QueuePublisher` service for outbound messages
-- `queue.consumer.base.ts` — `BaseQueueConsumer` abstract class for inbound handlers
-- `queue.module.ts` — `QueueModule` (registered globally)
+- `queue.interface.ts` — `IQueuePublisher` + `IQueueConsumer<T>` contracts
+- `queue.publisher.ts` — `NullQueuePublisher` — no-op stub for Phase 1
+- `queue.consumer.base.ts` — `BaseQueueConsumer<T>` — abstract base for feature consumers
+- `queue.module.ts` — `QueueModule` — global module, registers `INJECTION_TOKENS.QUEUE_PUBLISHER`
+
+## Message shape
+All messages use `QueueMessage<T>` from `shared/types`.
+Exchange and routing key constants live in `@common/constants/queue.constants`.
+
+## Replacing the implementation
+Bind a RabbitMQ class to `INJECTION_TOKENS.QUEUE_PUBLISHER` in `QueueModule`.
 
 ## Rules
-- Message payload shapes live in the feature module, NOT here
-- Business logic triggered by a message lives in the feature module, NOT here
-- Domain-specific retry logic lives in the feature module, NOT here
-- Exchange names and routing keys come from `common/constants/queue.constants.ts`
+- Inject via `INJECTION_TOKENS.QUEUE_PUBLISHER` + `IQueuePublisher` type
+- Message payload schemas live in the feature module, NOT here

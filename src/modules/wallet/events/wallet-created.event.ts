@@ -1,17 +1,6 @@
-import { createEvent } from '@shared/events/app-event.interface';
-import type { AppEvent } from '@shared/events/app-event.interface';
 import type { WalletFamily } from '../enums/wallet-family.enum';
 
 export const WALLET_CREATED = 'wallet.created' as const;
-
-export type WalletCreatedEvent = AppEvent & {
-  readonly walletId: string;
-  readonly address: string;
-  readonly driverFamily: WalletFamily;
-  readonly createdByJobId: string;
-  readonly signerVersion: string;
-  readonly createdAt: string;
-};
 
 export class WalletCreatedEvent {
   public readonly type = WALLET_CREATED;

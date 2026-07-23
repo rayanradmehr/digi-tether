@@ -24,9 +24,6 @@ import type { IEventPublisher } from '@shared/events/event-publisher.interface';
 import { NetworkService } from '@modules/network/services/network.service';
 import { NetworkDriver } from '@modules/network/enums/network-driver.enum';
 
-/**
- * Permitted token standard → driver mapping.
- */
 const ALLOWED_STANDARDS_BY_DRIVER: Readonly<Record<NetworkDriver, TokenStandard[]>> = {
   [NetworkDriver.EVM]: [TokenStandard.NATIVE, TokenStandard.ERC20],
   [NetworkDriver.TRON]: [TokenStandard.NATIVE, TokenStandard.TRC20],
@@ -97,7 +94,11 @@ export class TokenService {
     return this.networkService.getRequiredConfirmations(token.networkId);
   }
 
-  public async getExplorerUrl(id: string): Promise<string> {
+  /**
+   * Returns the block explorer URL for this token's contract address or symbol.
+   * Returns null when the network has no explorerBaseUrl configured.
+   */
+  public async getExplorerUrl(id: string): Promise<string | null> {
     const token = await this.requireToken(id);
     const hashOrAddress = token.contractAddress ?? token.symbol;
     return this.networkService.getExplorerUrl(token.networkId, hashOrAddress);

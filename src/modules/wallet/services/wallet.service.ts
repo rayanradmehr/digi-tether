@@ -1,8 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Inject } from '@nestjs/common';
-import { Cache } from 'cache-manager';
 import { DataSource } from 'typeorm';
 
 import type { IWalletRepository } from '../repositories/wallet.repository.interface';
@@ -31,6 +28,9 @@ import { WalletUnlockedEvent } from '../events/wallet-unlocked.event';
 import { WalletCompromisedEvent } from '../events/wallet-compromised.event';
 import { WalletArchivedEvent } from '../events/wallet-archived.event';
 import { WalletPoolLowEvent } from '../events/wallet-pool-low.event';
+
+import { INJECTION_TOKENS } from '@shared/tokens/injection-tokens';
+import type { ICache } from '@shared/cache/cache.interface';
 
 // ---------------------------------------------------------------------------
 // Contracts
@@ -82,26 +82,6 @@ function cacheKeyPoolCount(driverFamily: WalletFamily): string {
 // Service
 // ---------------------------------------------------------------------------
 
-/**
- * WalletService — single source of truth for wallet lifecycle management.
- *
- * Responsibilities (ARCHITECTURE.md §10.1):
- * - Wallet creation from Signer results
- * - Mandatory 2-phase assignment (reserve → assign) inside one transaction
- * - All state-machine transitions (lock / unlock / compromise / archive)
- * - Append-only audit log on every transition
- * - Domain event emission on every transition
- * - Cache population and invalidation
- * - Paginated wallet list (admin)
- *
- * Hard boundaries — this service MUST NEVER:
- * - Generate wallets, key pairs, or addresses
- * - Build blockchain payloads or transactions
- * - Sign any data
- * - Call blockchain RPC nodes
- * - Import ethers, tronweb, bitcoinjs-lib, or any blockchain SDK
- * - Call the Offline Signer directly
- */
 @Injectable()
 export class WalletService {
   private readonly logger = new Logger(WalletService.name);
@@ -113,8 +93,8 @@ export class WalletService {
     @Inject(WALLET_AUDIT_LOG_REPOSITORY)
     private readonly auditLogRepository: WalletAuditLogRepository,
 
-    @Inject(CACHE_MANAGER)
-    private readonly cache: Cache,
+    @Inject(INJECTION_TOKENS.CACHE)
+    private readonly cache: ICache,
 
     private readonly eventEmitter: EventEmitter2,
 
@@ -125,14 +105,6 @@ export class WalletService {
   // CREATION
   // =========================================================================
 
-  /**
-   * Persists a new AVAILABLE wallet record from a completed CREATE_WALLET
-   * SignerJob result.
-   *
-   * Guards:
-   * - Rejects if `publicKey` is absent or empty.
-   * - Idempotent: returns existing record when address already exists.
-   */
   public async createFromSignerResult(
     input: WalletCreationInput,
   ): Promise<WalletEntity> {
@@ -212,19 +184,9 @@ export class WalletService {
   }
 
   // =========================================================================
-  // ASSIGNMENT — mandatory 2-phase, single transaction
+  // ASSIGNMENT
   // =========================================================================
 
-  /**
-   * Assigns an AVAILABLE wallet to a customer using the mandatory 2-phase
-   * reserve → assign protocol inside a single database transaction.
-   *
-   * Idempotent: returns existing assignment when customer already has a
-   * wallet for the requested family.
-   *
-   * @throws {WalletFamilyNotSupportedError} When driverFamily is not a valid enum value.
-   * @throws {WalletPoolExhaustedError}       When no AVAILABLE wallet exists for the family.
-   */
   public async assignWallet(
     input: AssignWalletInput,
   ): Promise<WalletAssignmentResult> {
@@ -236,10 +198,6 @@ export class WalletService {
       input.driverFamily,
     );
     if (existing) {
-      this.logger.debug(
-        { walletId: existing.id, driverFamily: input.driverFamily },
-        'assignWallet — idempotent return of existing assignment',
-      );
       return {
         walletId: existing.id,
         address: existing.address,
@@ -250,18 +208,10 @@ export class WalletService {
     let assignedWallet!: WalletEntity;
 
     await this.dataSource.transaction(async () => {
-      const reservation = await this.walletRepository.reserveWallet(
-        input.driverFamily,
-      );
+      const reservation = await this.walletRepository.reserveWallet(input.driverFamily);
 
       if (!reservation) {
-        const availableCount = await this.walletRepository.countAvailable(
-          input.driverFamily,
-        );
-        this.logger.error(
-          { driverFamily: input.driverFamily, availableCount },
-          'Wallet pool exhausted — no AVAILABLE wallet for family',
-        );
+        const availableCount = await this.walletRepository.countAvailable(input.driverFamily);
         this.eventEmitter.emit(
           'wallet.pool.low',
           new WalletPoolLowEvent({
@@ -279,16 +229,6 @@ export class WalletService {
         reservationToken: reservation.reservationToken,
         customerId: input.customerId,
       });
-    });
-
-    await this.appendAuditLog({
-      walletId: assignedWallet.id,
-      action: WalletAuditAction.RESERVED,
-      previousStatus: WalletStatus.AVAILABLE,
-      newStatus: WalletStatus.RESERVED,
-      actor: WalletService.name,
-      reason: 'Phase 1 of 2-phase assignment',
-      metadata: { driverFamily: input.driverFamily },
     });
 
     await this.appendAuditLog({
@@ -314,11 +254,6 @@ export class WalletService {
       }),
     );
 
-    this.logger.log(
-      { walletId: assignedWallet.id, driverFamily: input.driverFamily },
-      'Wallet assigned to customer',
-    );
-
     return {
       walletId: assignedWallet.id,
       address: assignedWallet.address,
@@ -330,22 +265,10 @@ export class WalletService {
   // QUERIES
   // =========================================================================
 
-  /**
-   * Returns a paginated, filtered list of wallets.
-   * No cache — list queries must always reflect current state.
-   */
-  public async findAll(
-    query: WalletQueryDto,
-  ): Promise<PaginatedResult<WalletEntity>> {
+  public async findAll(query: WalletQueryDto): Promise<PaginatedResult<WalletEntity>> {
     return this.walletRepository.findAll(query);
   }
 
-  /**
-   * Returns a wallet by its UUID primary key.
-   * Cache-first: warm hit served without DB round-trip.
-   *
-   * @throws {WalletNotFoundError} When the wallet does not exist or is soft-deleted.
-   */
   public async findById(id: string): Promise<WalletEntity> {
     const cacheKey = cacheKeyById(id);
     const cached = await this.cache.get<WalletEntity>(cacheKey);
@@ -358,12 +281,6 @@ export class WalletService {
     return wallet;
   }
 
-  /**
-   * Returns the wallet assigned to a customer for a specific family.
-   * Cache key: customer + family composite.
-   *
-   * @throws {WalletNotFoundError} When no assignment exists for this combination.
-   */
   public async findByCustomer(
     customerId: string,
     driverFamily: WalletFamily,
@@ -376,36 +293,21 @@ export class WalletService {
     if (cached) return cached;
 
     const wallet = await this.walletRepository.findByCustomer(customerId, driverFamily);
-    if (!wallet) {
-      throw new WalletNotFoundError(
-        `customer:${customerId}:family:${driverFamily}`,
-      );
-    }
+    if (!wallet) throw new WalletNotFoundError(`customer:${customerId}:family:${driverFamily}`);
 
     await this.cache.set(cacheKey, wallet, CACHE_TTL_MS);
     return wallet;
   }
 
-  /**
-   * Returns all wallets across all families assigned to a customer.
-   * Uncached — list queries are not cached to avoid stale ordering.
-   */
   public async findAllByCustomer(customerId: string): Promise<WalletEntity[]> {
     this.assertCustomerIdNotEmpty(customerId);
     return this.walletRepository.findAllByCustomer(customerId);
   }
 
-  /**
-   * Returns a wallet by its blockchain address.
-   * Cache-first: warm hit served without DB round-trip.
-   *
-   * @throws {WalletNotFoundError} When the address is not found.
-   */
   public async findByAddress(address: string): Promise<WalletEntity> {
     if (!address || address.trim().length === 0) {
       throw new Error('address must not be empty');
     }
-
     const cacheKey = cacheKeyByAddress(address);
     const cached = await this.cache.get<WalletEntity>(cacheKey);
     if (cached) return cached;
@@ -417,13 +319,8 @@ export class WalletService {
     return wallet;
   }
 
-  /**
-   * Returns the count of AVAILABLE wallets for a family.
-   * Cached for 5 seconds — short TTL prevents stale pool metrics under polling.
-   */
   public async getPoolStatus(driverFamily: WalletFamily): Promise<number> {
     this.assertValidFamily(driverFamily);
-
     const cacheKey = cacheKeyPoolCount(driverFamily);
     const cached = await this.cache.get<number>(cacheKey);
     if (cached !== undefined && cached !== null) return cached;
@@ -434,29 +331,14 @@ export class WalletService {
   }
 
   // =========================================================================
-  // STATE TRANSITIONS — lock / unlock
+  // STATE TRANSITIONS
   // =========================================================================
 
-  /**
-   * Transitions a wallet to LOCKED status.
-   *
-   * Permitted from: AVAILABLE, ASSIGNED.
-   * Forbidden from: COMPROMISED, ARCHIVED (terminal), LOCKED (already).
-   *
-   * @throws {WalletNotFoundError}       Wallet not found.
-   * @throws {WalletTerminalStatusError} Wallet is in a terminal state.
-   * @throws {WalletInvalidStatusError}  Wallet is already LOCKED.
-   */
   public async lockWallet(walletId: string, reason: string): Promise<WalletEntity> {
     const wallet = await this.findById(walletId);
-
     this.assertNotTerminal(wallet);
     if (wallet.status === WalletStatus.LOCKED) {
-      throw new WalletInvalidStatusError(
-        walletId,
-        wallet.status,
-        'Wallet is already LOCKED',
-      );
+      throw new WalletInvalidStatusError(walletId, wallet.status, 'Wallet is already LOCKED');
     }
 
     const previousStatus = wallet.status;
@@ -485,27 +367,13 @@ export class WalletService {
       }),
     );
 
-    this.logger.log({ walletId, previousStatus, reason }, 'Wallet locked');
     return updated;
   }
 
-  /**
-   * Restores a LOCKED wallet to its previous status.
-   *
-   * Permitted from: LOCKED only.
-   *
-   * @throws {WalletNotFoundError}      Wallet not found.
-   * @throws {WalletInvalidStatusError} Wallet is not LOCKED.
-   */
   public async unlockWallet(walletId: string): Promise<WalletEntity> {
     const wallet = await this.findById(walletId);
-
     if (wallet.status !== WalletStatus.LOCKED) {
-      throw new WalletInvalidStatusError(
-        walletId,
-        wallet.status,
-        'Only LOCKED wallets can be unlocked',
-      );
+      throw new WalletInvalidStatusError(walletId, wallet.status, 'Only LOCKED wallets can be unlocked');
     }
 
     const restoredStatus = wallet.previousStatus ?? WalletStatus.AVAILABLE;
@@ -533,25 +401,10 @@ export class WalletService {
       }),
     );
 
-    this.logger.log({ walletId, restoredStatus }, 'Wallet unlocked');
     return updated;
   }
 
-  // =========================================================================
-  // STATE TRANSITIONS — terminal
-  // =========================================================================
-
-  /**
-   * Permanently decommissions a wallet to COMPROMISED.
-   * Terminal — no further transition is ever permitted.
-   *
-   * @throws {WalletNotFoundError}       Wallet not found.
-   * @throws {WalletTerminalStatusError} Already in a terminal state.
-   */
-  public async compromiseWallet(
-    walletId: string,
-    reason: string,
-  ): Promise<WalletEntity> {
+  public async compromiseWallet(walletId: string, reason: string): Promise<WalletEntity> {
     const wallet = await this.findById(walletId);
     this.assertNotTerminal(wallet);
 
@@ -581,38 +434,19 @@ export class WalletService {
       }),
     );
 
-    this.logger.warn({ walletId, reason }, 'Wallet compromised — terminal state');
     return updated;
   }
 
-  /**
-   * Retires a wallet to ARCHIVED status.
-   * Terminal — no further transition is ever permitted.
-   *
-   * Permitted from: AVAILABLE, LOCKED only.
-   * ASSIGNED wallets must be compromised, not archived.
-   *
-   * @throws {WalletNotFoundError}       Wallet not found.
-   * @throws {WalletTerminalStatusError} Already in a terminal state.
-   * @throws {WalletInvalidStatusError}  Status is not archivable (ASSIGNED, RESERVED).
-   */
-  public async archiveWallet(
-    walletId: string,
-    reason: string,
-  ): Promise<WalletEntity> {
+  public async archiveWallet(walletId: string, reason: string): Promise<WalletEntity> {
     const wallet = await this.findById(walletId);
     this.assertNotTerminal(wallet);
 
-    const archivableStatuses: WalletStatus[] = [
-      WalletStatus.AVAILABLE,
-      WalletStatus.LOCKED,
-    ];
+    const archivableStatuses: WalletStatus[] = [WalletStatus.AVAILABLE, WalletStatus.LOCKED];
     if (!archivableStatuses.includes(wallet.status)) {
       throw new WalletInvalidStatusError(
         walletId,
         wallet.status,
-        `Only AVAILABLE or LOCKED wallets may be archived. ` +
-        `Current status: ${wallet.status}`,
+        `Only AVAILABLE or LOCKED wallets may be archived. Current status: ${wallet.status}`,
       );
     }
 
@@ -641,7 +475,6 @@ export class WalletService {
       }),
     );
 
-    this.logger.log({ walletId, reason }, 'Wallet archived — terminal state');
     return updated;
   }
 
@@ -649,11 +482,6 @@ export class WalletService {
   // PRIVATE HELPERS
   // =========================================================================
 
-  /**
-   * Appends an entry to the append-only audit log.
-   * Audit failures are swallowed and logged at ERROR — they must NEVER
-   * roll back the parent business transaction.
-   */
   private async appendAuditLog(entry: {
     walletId: string;
     action: WalletAuditAction;
@@ -681,7 +509,6 @@ export class WalletService {
     }
   }
 
-  /** Invalidates all cache keys tied to a wallet entity. */
   private async invalidateWalletCaches(wallet: WalletEntity): Promise<void> {
     await Promise.allSettled([
       this.cache.del(cacheKeyById(wallet.id)),
@@ -692,36 +519,23 @@ export class WalletService {
     ]);
   }
 
-  /** Invalidates the pool available-count cache for a family. */
   private async invalidatePoolCountCache(driverFamily: WalletFamily): Promise<void> {
     await this.cache.del(cacheKeyPoolCount(driverFamily));
   }
 
-  /**
-   * Guards: COMPROMISED and ARCHIVED are permanently terminal.
-   * @throws {WalletTerminalStatusError}
-   */
   private assertNotTerminal(wallet: WalletEntity): void {
-    const terminalStatuses: WalletStatus[] = [
-      WalletStatus.COMPROMISED,
-      WalletStatus.ARCHIVED,
-    ];
+    const terminalStatuses: WalletStatus[] = [WalletStatus.COMPROMISED, WalletStatus.ARCHIVED];
     if (terminalStatuses.includes(wallet.status)) {
       throw new WalletTerminalStatusError(wallet.id, wallet.status);
     }
   }
 
-  /**
-   * Guards against unsupported WalletFamily values.
-   * @throws {WalletFamilyNotSupportedError}
-   */
   private assertValidFamily(driverFamily: WalletFamily): void {
     if (!Object.values(WalletFamily).includes(driverFamily)) {
       throw new WalletFamilyNotSupportedError(driverFamily as string);
     }
   }
 
-  /** Guards against empty customerId strings. */
   private assertCustomerIdNotEmpty(customerId: string): void {
     if (!customerId || customerId.trim().length === 0) {
       throw new Error('customerId must not be empty');

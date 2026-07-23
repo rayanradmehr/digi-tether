@@ -6,6 +6,8 @@ import { CoreModule } from '@core/core.module';
 import { SharedModule } from '@shared/shared.module';
 import { HealthModule } from '@modules/health/health.module';
 import { NetworkModule } from '@modules/network/network.module';
+import { TokenModule } from '@modules/token/token.module';
+import { WalletModule } from '@modules/wallet/wallet.module';
 
 /**
  * Root application module.
@@ -16,7 +18,7 @@ import { NetworkModule } from '@modules/network/network.module';
  * 3. SharedModule     — global infrastructure providers (logger, cache, queue, events)
  * 4. CoreModule       — global filters, interceptors, middleware
  * 5. QueuesModule     — RabbitMQ placeholder (Phase 0 legacy)
- * 6. Feature modules  — Health, Network, … (business modules in dependency order)
+ * 6. Feature modules  — Health, Network, Token, Wallet (business modules in dependency order)
  */
 @Module({
   imports: [
@@ -27,6 +29,8 @@ import { NetworkModule } from '@modules/network/network.module';
     QueuesModule,
     HealthModule,
     NetworkModule,
+    TokenModule,
+    WalletModule,
   ],
 })
 export class AppModule {}

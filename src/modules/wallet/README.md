@@ -25,6 +25,7 @@ This module owns:
 | Store balances | Blockchain Sync Module (Phase 5+) |
 | Create transactions | Transaction Module |
 | Sign transactions | Offline Signer |
+| Build blockchain payloads | Offline Signer exclusively |
 | Communicate with blockchain nodes | Blockchain Sync Module |
 | Interpret customer identity | Exchange |
 | Verify cryptographic signatures | Offline Signer |
@@ -34,11 +35,12 @@ This module owns:
 ## Responsibilities
 
 1. **Wallet Pool** — maintain a pool of `AVAILABLE` pre-generated wallets per family.
-2. **Assignment** — atomically assign one `AVAILABLE` wallet to a customer.
-3. **Lifecycle** — manage status transitions: AVAILABLE → ASSIGNED → LOCKED → ARCHIVED.
+2. **Assignment** — assign one wallet to a customer using the mandatory 2-phase reservation protocol.
+3. **Lifecycle** — manage status transitions: `AVAILABLE → RESERVED → ASSIGNED`, plus `LOCKED`, `COMPROMISED`, `ARCHIVED`.
 4. **Replenishment** — detect low pool levels and create `CREATE_WALLET` SignerJobs.
-5. **Audit** — write an append-only audit log entry for every status transition.
-6. **Events** — emit domain events for every significant state change.
+5. **Reservation Cleanup** — release expired reservations back to `AVAILABLE` every 10 seconds.
+6. **Audit** — write an append-only audit log entry for every status transition.
+7. **Events** — emit domain events for every significant state change.
 
 ---
 
@@ -56,7 +58,7 @@ This module owns:
 
 | Module | Usage |
 |---|---|
-| `SweepModule` | Resolve source wallet by customerId + family |
+| `SweepModule` | Resolve source wallet by customerId + driverFamily |
 | `WithdrawalModule` | Resolve source wallet |
 | `DepositModule` | Resolve receiving address |
 
@@ -85,18 +87,20 @@ a `driverKey` mapping addition in `WalletFamilyResolver`.
 ## Wallet Status Machine
 
 ```
-AVAILABLE ──► ASSIGNED  (terminal for assignment; one customer forever)
-AVAILABLE ──► LOCKED ──► AVAILABLE  (temporary freeze)
-AVAILABLE ──► COMPROMISED  (terminal)
-AVAILABLE ──► ARCHIVED    (terminal)
-ASSIGNED  ──► LOCKED ──► ASSIGNED   (investigation hold)
-ASSIGNED  ──► COMPROMISED  (terminal)
-LOCKED    ──► COMPROMISED  (terminal)
-LOCKED    ──► ARCHIVED     (terminal)
+AVAILABLE ──► RESERVED ──► ASSIGNED   (mandatory 2-phase; terminal for assignment)
+RESERVED  ──► AVAILABLE                (reservation timeout or explicit release)
+AVAILABLE ──► LOCKED ──► AVAILABLE    (temporary freeze)
+ASSIGNED  ──► LOCKED ──► ASSIGNED     (investigation hold)
+AVAILABLE ──► COMPROMISED             (terminal)
+AVAILABLE ──► ARCHIVED                (terminal)
+ASSIGNED  ──► COMPROMISED             (terminal)
+LOCKED    ──► COMPROMISED             (terminal)
+LOCKED    ──► ARCHIVED                (terminal)
 ```
 
 `COMPROMISED` and `ARCHIVED` are permanently terminal.
 A wallet may only be assigned **once** — `customer_id` never changes.
+**Direct `AVAILABLE → ASSIGNED` is permanently forbidden.** Reservation is mandatory.
 
 ---
 
@@ -104,14 +108,21 @@ A wallet may only be assigned **once** — `customer_id` never changes.
 
 ### Invariant
 For every active `WalletFamily`, the number of `AVAILABLE` wallets must
-remain ≥ `minPoolSize` (default: 500).
+remain ≥ `minPoolSize` (default: 500). `RESERVED` wallets are excluded from
+the available count.
 
 ### Replenishment Trigger
 When available wallets fall below `replenishThreshold` (default: 100):
 1. `WalletPoolService` creates `batchSize` (default: 50) `CREATE_WALLET` SignerJobs.
-2. The Offline Signer processes jobs asynchronously.
-3. Each completed job produces one new `AVAILABLE` wallet.
-4. `WalletPoolReplenished` event is emitted when pool recovers.
+2. Each job payload is `CreateWalletJobPayload { driverFamily, quantity: 1, reason: 'pool_replenishment' }`.
+3. The Offline Signer processes jobs asynchronously.
+4. Each completed job produces one new `AVAILABLE` wallet.
+5. `WalletPoolReplenished` event is emitted when pool recovers.
+
+### Reservation TTL
+Any wallet held in `RESERVED` status longer than `reservation_ttl_seconds`
+(default: 30 seconds) is automatically released back to `AVAILABLE` by the
+reservation cleanup cron (runs every 10 seconds).
 
 ### Monitoring
 `WalletPoolLow` event triggers a production alert when pool < threshold.
@@ -126,13 +137,21 @@ Pool status is visible via `GET /v1/wallets/pool/status`.
   → WalletPoolService.checkAllFamilies()
   → available < replenishThreshold
   → Creates CREATE_WALLET SignerJob(s)
+     payload: CreateWalletJobPayload { driverFamily, quantity: 1, reason }
   → Offline Signer polls, claims, generates key pair
   → Signer posts result to /signer/jobs/:requestId/result
+     result includes: address, publicKey, publicKeyFingerprint, signerVersion
   → WalletCreationResultHandler processes result
+  → Validates: publicKey is present (mandatory)
   → WalletService.createFromSignerResult()
   → Wallet stored: status = AVAILABLE
   → WalletCreated event emitted
   → WalletPoolReplenished event emitted
+
+[Cron: 10s interval]
+  → WalletReservationCleanupTask runs
+  → WalletRepository.releaseExpiredReservations()
+  → Any RESERVED wallet older than reservation_ttl_seconds → AVAILABLE
 ```
 
 The backend **never** generates keys. The Signer **never** sends private keys.
@@ -141,15 +160,31 @@ The backend **never** generates keys. The Signer **never** sends private keys.
 
 ## Wallet Assignment Flow
 
+Assignment is a mandatory 2-phase operation. Both phases run inside a
+single database transaction.
+
 ```
 Exchange API call: POST /v1/wallets/assign
   → WalletController.assign()
-  → WalletService.assignWallet({ customerId, family })
-  → WalletRepository.findFirstAvailable(family) [FOR UPDATE SKIP LOCKED]
-  → WalletRepository.update(wallet, { status: ASSIGNED, customerId })
+  → WalletService.assignWallet({ customerId, driverFamily })
+  → Check: customer already has wallet for this family?
+       YES → return existing wallet (idempotent)
+  → BEGIN TRANSACTION
+      PHASE 1 — Reserve:
+        WalletRepository.reserveWallet(driverFamily)
+          SELECT ... WHERE status='AVAILABLE' ORDER BY created_at ASC LIMIT 1
+          FOR UPDATE SKIP LOCKED
+          UPDATE SET status='RESERVED', reservation_token=uuid(), reserved_at=NOW()
+          → null → ROLLBACK → throw WalletPoolExhaustedError
+      PHASE 2 — Assign:
+        WalletRepository.assignWallet({ walletId, reservationToken, customerId })
+          UPDATE SET status='ASSIGNED', customer_id=..., assigned_at=NOW(),
+            reservation_token=NULL, reserved_at=NULL
+          WHERE id=$1 AND reservation_token=$2 AND status='RESERVED'
+  → COMMIT
   → WalletAuditLogRepository.append(entry)
   → WalletAssigned event emitted
-  → Return: { walletId, address, family }
+  → Return: { walletId, address, driverFamily }
 ```
 
 Assignment latency: < 50ms. No Signer involvement.
@@ -171,8 +206,28 @@ Assignment latency: < 50ms. No Signer involvement.
 
 ### Private Key Isolation
 Private keys exist **only** inside the Offline Signer.
-The backend stores only: `address`, `publicKeyFingerprint`, `signerVersion`.
+The backend stores per wallet:
+- `address` — derivable from public key; not sensitive.
+- `publicKey` — full public key hex; not sensitive (derivable from any on-chain tx).
+- `publicKeyFingerprint` — compact SHA-256 audit reference; not sensitive.
+- `signerVersion` — audit metadata only.
+
 No private key data ever touches the backend network.
+
+---
+
+## Error Types
+
+| Error | Trigger |
+|---|---|
+| `WalletNotFoundError` | Wallet not found by ID or address |
+| `WalletAlreadyAssignedError` | Attempt to assign an already-assigned wallet |
+| `WalletPoolExhaustedError` | No AVAILABLE wallets in pool for the requested family |
+| `WalletInvalidStatusError` | Lifecycle transition not permitted from current status |
+| `WalletTerminalStatusError` | Attempt to transition a COMPROMISED or ARCHIVED wallet |
+| `WalletReservationTokenMismatchError` | Token presented does not match reservation |
+| `WalletFamilyNotSupportedError` | Unrecognised driver family |
+| `WalletDuplicateCustomerError` | Customer already has a wallet for this family |
 
 ---
 
@@ -255,7 +310,8 @@ No private key data ever touches the backend network.
 
 ## Architecture References
 
-- Phase 4 Architecture Document (this file + `ARCHITECTURE.md`)
+- Phase 4 Architecture Document (`ARCHITECTURE.md`)
+- Phase 4 Domain Model (`DOMAIN-MODEL.md`)
 - Phase 3.5 SignerJob Module (`src/modules/signer-job/README.md`)
-- ADR-WM-001 through ADR-WM-009 (`src/modules/wallet/ADR.md`)
+- ADR-WM-001 through ADR-WM-010 (`src/modules/wallet/ADR.md`)
 - Architecture Rules §3 (Private Key Isolation), §12 (No Crypto in Backend)

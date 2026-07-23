@@ -50,15 +50,23 @@ Therefore, wallet generation can only occur on the Offline Signer.
 
 The backend creates `CREATE_WALLET` SignerJobs when the pool falls below
 the replenish threshold. The Offline Signer generates the key pair,
-computes the address, and returns only the public key and address in
-the result. The private key never leaves the Signer.
+computes the address, and returns the address, the full public key,
+and the public key fingerprint in the result.
+The private key never leaves the Signer.
+
+The backend stores per wallet:
+- `address` — the blockchain address (mandatory, immutable)
+- `publicKey` — the full public key hex string (mandatory, immutable)
+- `publicKeyFingerprint` — SHA-256 fingerprint of publicKey (optional, audit shorthand)
+- `signerVersion` — Signer binary version that generated this wallet (optional, audit)
 
 **Consequences**
 
 - Pool replenishment is asynchronous; throughput is bounded by Signer capacity.
 - `batchSize` and `maxConcurrentJobs` must be tuned for each deployment.
-- The backend stores `publicKeyFingerprint` and `signerVersion` for audit,
-  but never stores or processes the private key.
+- A `CREATE_WALLET` result without a `publicKey` is rejected by the backend.
+- The backend is free of any cryptographic key-generation library.
+- The attack surface for key extraction from the backend is zero.
 
 ---
 
@@ -183,7 +191,7 @@ time by the calling module via the `NetworkModule`.
 
 ---
 
-## ADR-WM-007: Backend Never Creates or Owns Wallets
+## ADR-WM-007: Backend Stores Only Non-Sensitive Wallet Fields
 
 **Status**: Accepted
 
@@ -198,21 +206,33 @@ Wallet creation requires generating a cryptographic key pair. The backend:
 **Decision**
 
 Wallet creation is exclusively the responsibility of the Offline Signer.
-The backend only stores the resulting address and public key fingerprint.
-The backend triggers creation by publishing a `CREATE_WALLET` SignerJob;
-it never calls any key generation function directly.
+The backend stores only fields that are non-sensitive and required for
+operational or audit purposes:
+
+| Field | Sensitivity | Reason Stored |
+|---|---|---|
+| `address` | Not sensitive | Blockchain identity; required for routing deposits/withdrawals |
+| `publicKey` | Not sensitive | Derivable from any on-chain transaction; required for audit and future verification |
+| `publicKeyFingerprint` | Not sensitive | Compact SHA-256 audit shorthand |
+| `signerVersion` | Not sensitive | Audit provenance of key generation |
+
+The backend never stores, transmits, or requests the private key.
+The backend triggers creation by publishing a `CREATE_WALLET` SignerJob
+with `CreateWalletJobPayload { driverFamily, quantity, reason }` — no
+cryptographic content.
 
 **Consequences**
 
 - The backend is free of any cryptographic key-generation library.
 - The attack surface for key extraction from the backend is zero.
 - In the event of a backend compromise, no private keys are exposed.
+- `publicKey` being mandatory means a Signer result without it is rejected.
 - Creation throughput is bounded by Signer availability; this is acceptable
   because the pool buffers demand.
 
 ---
 
-## ADR-WM-008: Optimistic Locking on Wallet Assignment
+## ADR-WM-008: Optimistic Locking on Wallet Operations
 
 **Status**: Accepted
 
@@ -225,14 +245,23 @@ This would violate the one-wallet-per-customer-per-family invariant.
 **Decision**
 
 The `wallets` table uses a TypeORM `@VersionColumn` for optimistic locking.
-Additionally, `WalletRepository.findFirstAvailable()` uses
-`FOR UPDATE SKIP LOCKED` to prevent phantom reads at the database level.
-If a version conflict occurs, the service retries once before throwing
-`WalletPoolExhaustedError`.
+Every `update()` call increments the `version` column.
+If two concurrent transactions attempt to update the same row, one will
+fail with an `OptimisticLockVersionMismatchError` and must retry.
+
+In addition, the 2-phase reservation protocol (see ADR-WM-010 and
+DOMAIN-MODEL §5) uses `FOR UPDATE SKIP LOCKED` to prevent phantom reads,
+and a `reservation_token` ownership check to prevent one caller from
+completing another caller's reservation.
+
+If a version conflict occurs during the reserve or assign phase,
+the service retries once before throwing `WalletPoolExhaustedError`.
 
 **Consequences**
 
 - Wallet assignment is safe under concurrent load.
+- Three independent mechanisms defend against duplicate assignment:
+  `FOR UPDATE SKIP LOCKED`, `@VersionColumn`, and `reservation_token`.
 - Retry adds at most one round-trip per assignment under contention.
 - Under extreme concurrency, callers may receive `WalletPoolExhaustedError`
   even when wallets are available — the retry mitigates this in practice.
@@ -264,3 +293,59 @@ Audit log retention is ≥ 7 years (configurable per jurisdiction).
 - Audit log grows unbounded — archival and partitioning strategy required in Phase 5+.
 - A corrupt or missing audit log row is a data integrity incident.
 - The `WalletAuditLogRepository.append()` is the only permitted mutation method.
+
+---
+
+## ADR-WM-010: 2-Phase Reservation Protocol for Race-Condition-Safe Assignment
+
+**Status**: Accepted
+
+**Context**
+
+Direct `AVAILABLE → ASSIGNED` in a single step is vulnerable to a race
+condition where two concurrent callers both read the same `AVAILABLE` wallet
+before either has written. Even with `FOR UPDATE SKIP LOCKED`, the window
+between the read and the write creates risk under extreme concurrency.
+
+Furthermore, customer onboarding requires a validation step between
+"wallet claimed" and "wallet committed to customer" — for example,
+checking that the customer does not already have a wallet for this family.
+This validation must occur after the wallet is claimed but before it is
+permanently assigned.
+
+**Decision**
+
+Wallet assignment is always a 2-phase operation:
+
+**Phase 1 — Reserve:** `WalletRepository.reserveWallet(driverFamily)` atomically
+selects one `AVAILABLE` wallet using `SELECT ... FOR UPDATE SKIP LOCKED`,
+updates its `status` to `RESERVED`, sets `reservation_token = uuid()`,
+`reserved_at = NOW()`, and returns `{ walletId, reservationToken }`.
+
+**Phase 2 — Assign:** `WalletRepository.assignWallet({ walletId, reservationToken, customerId })`
+updates the row to `status = ASSIGNED` only when both the wallet ID and the
+reservation token match — atomically confirming ownership before committing.
+
+Both phases execute inside a single database transaction in `WalletService.assignWallet()`.
+Direct `AVAILABLE → ASSIGNED` skipping `RESERVED` is permanently forbidden at
+the service layer.
+
+Reservation TTL is configurable via `wallet_pool_config.reservation_ttl_seconds`
+(default: 30 seconds). The `WalletReservationCleanupTask` (cron every 10 seconds)
+releases expired reservations back to `AVAILABLE` via `WalletRepository.releaseExpiredReservations()`.
+
+**Consequences**
+
+- Three independent mechanisms prevent duplicate assignment:
+  1. `FOR UPDATE SKIP LOCKED` — only one transaction can hold the row lock.
+  2. `@VersionColumn` optimistic lock — concurrent updates to the same row fail.
+  3. `reservation_token` ownership check — prevents a different caller from completing
+     someone else's reservation.
+- Reservation introduces a transient `RESERVED` state visible in pool counts;
+  `RESERVED` wallets are excluded from the available count.
+- Expired reservations are automatically cleaned up — assignment failures do not
+  permanently remove wallets from the pool.
+- The `(customer_id, driver_family)` UNIQUE constraint provides a final
+  database-level guard against duplicate assignment.
+
+**Cross-reference**: DOMAIN-MODEL.md §5, §6, ADR-WM-D-002.

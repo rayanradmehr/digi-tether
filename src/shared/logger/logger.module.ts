@@ -5,15 +5,17 @@ import { AppLoggerService } from './logger.service';
 /**
  * Registers `AppLoggerService` globally under `INJECTION_TOKENS.LOGGER`.
  *
- * Mark as `@Global()` so every module can inject `ILogger` without
- * importing `LoggerModule` individually.
+ * useFactory instead of useClass — AppLoggerService accepts an optional
+ * `context?: string` constructor param which NestJS DI would try to resolve
+ * as a String provider and fail with UnknownDependenciesException.
+ * useFactory bypasses DI for constructor args and instantiates directly.
  */
 @Global()
 @Module({
   providers: [
     {
       provide: INJECTION_TOKENS.LOGGER,
-      useClass: AppLoggerService,
+      useFactory: () => new AppLoggerService(),
     },
   ],
   exports: [INJECTION_TOKENS.LOGGER],

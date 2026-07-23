@@ -1,5 +1,4 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
 import { DataSource } from 'typeorm';
 
 import type { IWalletRepository } from '../repositories/wallet.repository.interface';
@@ -31,6 +30,7 @@ import { WalletPoolLowEvent } from '../events/wallet-pool-low.event';
 
 import { INJECTION_TOKENS } from '@shared/tokens/injection-tokens';
 import type { ICache } from '@shared/cache/cache.interface';
+import type { IEventPublisher } from '@shared/events/event-publisher.interface';
 
 // ---------------------------------------------------------------------------
 // Contracts
@@ -96,7 +96,8 @@ export class WalletService {
     @Inject(INJECTION_TOKENS.CACHE)
     private readonly cache: ICache,
 
-    private readonly eventEmitter: EventEmitter2,
+    @Inject(INJECTION_TOKENS.EVENT_PUBLISHER)
+    private readonly eventPublisher: IEventPublisher,
 
     private readonly dataSource: DataSource,
   ) {}
@@ -163,8 +164,7 @@ export class WalletService {
 
     await this.invalidatePoolCountCache(input.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.created',
+    this.eventPublisher.publish(
       new WalletCreatedEvent({
         walletId: wallet.id,
         address: wallet.address,
@@ -212,8 +212,7 @@ export class WalletService {
 
       if (!reservation) {
         const availableCount = await this.walletRepository.countAvailable(input.driverFamily);
-        this.eventEmitter.emit(
-          'wallet.pool.low',
+        this.eventPublisher.publish(
           new WalletPoolLowEvent({
             driverFamily: input.driverFamily,
             availableCount,
@@ -243,8 +242,7 @@ export class WalletService {
     await this.invalidateWalletCaches(assignedWallet);
     await this.invalidatePoolCountCache(input.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.assigned',
+    this.eventPublisher.publish(
       new WalletAssignedEvent({
         walletId: assignedWallet.id,
         address: assignedWallet.address,
@@ -356,8 +354,7 @@ export class WalletService {
     await this.invalidateWalletCaches(wallet);
     await this.invalidatePoolCountCache(wallet.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.locked',
+    this.eventPublisher.publish(
       new WalletLockedEvent({
         walletId,
         driverFamily: updated.driverFamily,
@@ -391,8 +388,7 @@ export class WalletService {
     await this.invalidateWalletCaches(wallet);
     await this.invalidatePoolCountCache(wallet.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.unlocked',
+    this.eventPublisher.publish(
       new WalletUnlockedEvent({
         walletId,
         driverFamily: updated.driverFamily,
@@ -423,8 +419,7 @@ export class WalletService {
     await this.invalidateWalletCaches(wallet);
     await this.invalidatePoolCountCache(wallet.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.compromised',
+    this.eventPublisher.publish(
       new WalletCompromisedEvent({
         walletId,
         address: wallet.address,
@@ -465,8 +460,7 @@ export class WalletService {
     await this.invalidateWalletCaches(wallet);
     await this.invalidatePoolCountCache(wallet.driverFamily);
 
-    this.eventEmitter.emit(
-      'wallet.archived',
+    this.eventPublisher.publish(
       new WalletArchivedEvent({
         walletId,
         driverFamily: wallet.driverFamily,
